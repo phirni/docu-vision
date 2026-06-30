@@ -2,6 +2,10 @@
 FastAPI application for document extraction pipeline.
 """
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import shutil
 from pathlib import Path
 

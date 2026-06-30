@@ -5,7 +5,7 @@ Checks each component independently and reports what works/fails.
 
 import sys
 from pathlib import Path
-
+import json
 # Add your project to path if needed
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -250,37 +250,45 @@ except Exception as e:
     print(f"  ❌ Database test failed: {e}")
 
 # ============================================================
-# Test 6: Extractor (optional — requires API key)
+# Test 6: Extractor with Ollama
 # ============================================================
-print("\n[6/6] Testing extractor (skipped if no API key)...")
+# Test 6: Extractor with Groq
+print("\n[6/6] Testing extractor with Groq...")
 try:
-    import os
-    if os.getenv("OPENAI_API_KEY"):
-        from app.extractor import ConstrainedExtractor
-        
-        extractor = ConstrainedExtractor(backend="openai")
-        
-        # Test with sample OCR text
-        sample_text = """
-        INCOME TAX DEPARTMENT
-        PAN: ABCDE1234F
-        Name: ARJUN MEHTA
-        Father Name: RAJESH MEHTA
-        DOB: 15/08/1990
-        """
-        
-        try:
-            result = extractor.extract(sample_text, "pan", model_version="test")
-            print(f"  ✅ Extractor: OpenAI extraction works")
-            print(f"     Extracted: {result}")
-        except Exception as e:
-            print(f"  ⚠️  Extractor API call failed (check key/quota): {e}")
-    else:
-        print("  ⏭️  Skipping extractor test (set OPENAI_API_KEY to test)")
-        
+    from app.extractor import ConstrainedExtractor
+    
+    extractor = ConstrainedExtractor()
+    print(f"  Using model: {extractor.model}")
+    
+    sample_text = """
+    INCOME TAX DEPARTMENT
+    GOVT OF INDIA
+    Permanent Account Number Card
+    PAN: ABCDE1234F
+    Name: ARJUN MEHTA
+    Father's Name: RAJESH MEHTA
+    DOB: 15/08/1990
+    Gender: MALE
+    """
+    
+    print("  Extracting from sample text...")
+    result = extractor.extract(sample_text, "pan", model_version="test")
+    
+    print(f"  ✅ Extractor works with Groq!")
+    print(f"     Name: {result.get('name')}")
+    print(f"     PAN: {result.get('pan_number')}")
+    print(f"     DOB: {result.get('dob')}")
+    
+    # Test confidence
+    print("  Testing confidence estimation...")
+    result_with_conf, scores = extractor.extract_with_confidence(
+        sample_text, "pan", model_version="test"
+    )
+    if scores:
+        print(f"  ✅ Confidence scores: {json.dumps(scores, indent=4)}")
+    
 except Exception as e:
-    print(f"  ❌ Extractor import failed: {e}")
-
+    print(f"  ❌ Extractor test failed: {e}")
 # ============================================================
 # Summary
 # ============================================================

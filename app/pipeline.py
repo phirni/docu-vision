@@ -2,9 +2,11 @@
 Shared extraction pipeline used by the API and background tasks.
 """
 
-import os
-from pathlib import Path
 from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from app.classifier import DocumentClassifier
 from app.database import db
@@ -23,9 +25,7 @@ class ExtractionPipeline:
     ):
         self.ocr_engine = ocr_engine or OCREngine()
         self.classifier = classifier or DocumentClassifier()
-        self.extractor = extractor or ConstrainedExtractor(
-            backend=os.getenv("EXTRACTION_BACKEND", "openai")
-        )
+        self.extractor = extractor or ConstrainedExtractor()
         self.validator = validator or ExtractionValidator()
 
     def process(

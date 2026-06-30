@@ -1,7 +1,6 @@
-# app/extractor.py
 """
-Constrained extraction engine.
-Forces LLM output to match Pydantic schemas.
+Constrained extraction engine using Groq API (free tier).
+Fast, reliable, no local GPU needed.
 """
 
 from typing import Type, Dict, Any, Optional
@@ -9,27 +8,20 @@ from pydantic import BaseModel
 from app.schemas import SCHEMA_MAP, BaseIDDocument
 import json
 import os
+from groq import Groq
 
 
 class ConstrainedExtractor:
     """
-    Extracts structured data from OCR text using constrained generation.
+    Extracts structured data using Groq's API with JSON mode.
     
-    The Pydantic schema becomes the grammar — the model cannot output
-    invalid JSON. This is the boundary between "model guess" and "validated data."
-    
-    Supports multiple backends:
-    - openai: Native structured outputs (fastest path, API required)
-    - outlines: Local constrained generation (token masking, more impressive)
-    - vllm: If you're using vLLM's guided decoding
+    Free tier: 30 requests/minute, enough for development.
+    Uses structured output to force valid JSON matching your schema.
     """
     
-    def __init__(self, backend: str = "openai"):
-        self.backend = backend
-        
-        # Lazy load model clients
-        self._openai_client = None
-        self._outlines_model = None
+    def __init__(self, model: str = None):
+        self.model = model or os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
     def extract(
         self,
@@ -37,212 +29,95 @@ class ConstrainedExtractor:
         document_type: str,
         model_version: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Extract structured data constrained to the document's schema.
+        """Extract structured data using Groq with JSON mode."""
         
-        Args:
-            ocr_text: Raw OCR output from the image
-            document_type: "pan", "indian_passport", "aadhaar"
-            model_version: Version tag for observability
-        
-        Returns:
-            Dictionary guaranteed to parse into the target schema
-        """
-        # Get the right schema for this document type
         schema = SCHEMA_MAP.get(document_type)
         if schema is None:
             raise ValueError(f"No schema for document type: {document_type}")
         
-        # Dispatch to backend
-        if self.backend == "openai":
-            result = self._extract_openai(ocr_text, schema)
-        elif self.backend == "outlines":
-            result = self._extract_outlines(ocr_text, schema)
-        else:
-            raise ValueError(f"Unknown backend: {self.backend}")
+        # Get schema as JSON for the prompt
+        schema_json = schema.model_json_schema()
+        field_descriptions = self._format_schema_for_prompt(schema_json)
+        
+        system_prompt = f"""You extract information from OCR text into JSON.
+Return ONLY a valid JSON object. No other text.
+If a field is not visible, set it to null.
+
+The JSON must have these fields:
+{field_descriptions}"""
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"OCR Text:\n{ocr_text}\n\nExtract JSON:"}
+            ],
+            temperature=0.0,
+            max_tokens=512,
+            response_format={"type": "json_object"},  # Forces valid JSON
+        )
+        
+        content = response.choices[0].message.content
+        extracted = json.loads(content)
         
         # Add metadata
-        result["document_type"] = document_type
+        extracted["document_type"] = document_type
         if model_version:
-            result["model_version"] = model_version
+            extracted["model_version"] = model_version
         
-        return result
+        return extracted
     
-    # ========== OpenAI Backend ==========
-    
-    def _extract_openai(
-        self, 
-        ocr_text: str, 
-        schema: Type[BaseModel]
-    ) -> Dict:
-        """OpenAI structured outputs — simplest integration."""
-        from openai import OpenAI
-        
-        if self._openai_client is None:
-            self._openai_client = OpenAI()
-        
-        response = self._openai_client.beta.chat.completions.parse(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Extract information from the OCR text into the required JSON structure. "
-                        "If a field is not clearly visible in the text, set it to null. "
-                        "Do not hallucinate or guess values."
-                    )
-                },
-                {"role": "user", "content": ocr_text}
-            ],
-            response_format=schema,  # ← The Pydantic model IS the constraint
-            temperature=0.0,  # Deterministic for extraction
-        )
-        
-        # Parse the guaranteed-valid JSON
-        return json.loads(response.choices[0].message.content)
-    
-    # ========== Outlines Backend (Your Depth Area) ==========
-    
-    def _extract_outlines(
-        self, 
-        ocr_text: str, 
-        schema: Type[BaseModel]
-    ) -> Dict:
-        """
-        Local constrained generation with Outlines.
-        
-        This is where the real engineering happens:
-        - Schema → regex grammar compilation
-        - Token-by-token masking during sampling
-        - Zero chance of malformed output
-        """
-        import outlines
-        from outlines import models, generate
-        
-        # Load model once (cached after first call)
-        if self._outlines_model is None:
-            model_name = os.getenv(
-                "LOCAL_MODEL", 
-                "Qwen/Qwen2.5-1.5B-Instruct"
-            )
-            self._outlines_model = models.transformers(
-                model_name,
-                device="cuda" if self._has_gpu() else "cpu"
-            )
-        
-        # Compile schema → token constraint grammar
-        # This is the key step: Pydantic model becomes a regex that
-        # filters the token vocabulary at each generation step
-        generator = generate.json(
-            self._outlines_model, 
-            schema,
-            sampler=outlines.samplers.greedy()  # Deterministic for extraction
-        )
-        
-        prompt = f"""Extract information from this OCR text into valid JSON.
-Only include fields that are clearly visible. Return null for missing fields.
-
-OCR Text:
-{ocr_text}
-
-JSON Output:"""
-        
-        # Generate with token masking active
-        # At each step, tokens that would break the JSON are masked to -inf
-        result = generator(prompt)
-        
-        # result is already a Pydantic model instance
-        return result.model_dump()
-    
-    # ========== Utilities ==========
-    
-    def _has_gpu(self) -> bool:
-        """Check if GPU is available for local models."""
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except ImportError:
-            return False
-    
-    def extract_with_logprobs(
+    def extract_with_confidence(
         self,
         ocr_text: str,
-        document_type: str
+        document_type: str,
+        model_version: Optional[str] = None
     ) -> tuple[Dict, Dict[str, float]]:
-        """
-        Extract AND return token-level probabilities for calibration.
+        """Extract and estimate per-field confidence."""
         
-        This is needed for your second depth area (calibrated confidence).
-        """
-        # Extract normally
-        result = self.extract(ocr_text, document_type)
+        result = self.extract(ocr_text, document_type, model_version)
         
-        # Collect logprobs from the model
-        # (Implementation depends on backend — OpenAI returns logprobs,
-        #  Outlines can be configured to return them)
-        raw_scores = self._collect_token_scores(ocr_text, document_type)
+        # Ask model to rate its confidence
+        fields = {k: v for k, v in result.items() 
+                  if v is not None and k not in ("document_type", "model_version", "confidence_scores")}
         
-        return result, raw_scores
-    
-    def _collect_token_scores(
-        self, 
-        ocr_text: str, 
-        document_type: str
-    ) -> Dict[str, float]:
-        """
-        Collect raw token probabilities per field.
-        These will be calibrated later.
-        """
-        if self.backend == "openai":
-            return self._collect_openai_logprobs(ocr_text, document_type)
-        # Outlines logprob collection needs model-specific implementation
-        # For now, return empty — you build this when you do calibration
-        return {}
-    
-    def _collect_openai_logprobs(
-        self, 
-        ocr_text: str, 
-        document_type: str
-    ) -> Dict[str, float]:
-        """Get token-level logprobs from OpenAI."""
-        from openai import OpenAI
+        if not fields:
+            return result, {}
         
-        schema = SCHEMA_MAP[document_type]
-        client = OpenAI()
-        
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        response = self.client.chat.completions.create(
+            model=self.model,
             messages=[
-                {"role": "system", "content": "Extract information into JSON."},
-                {"role": "user", "content": ocr_text}
+                {"role": "system", "content": "Rate your confidence (0.0-1.0) in each extracted field. Return JSON: {\"field_name\": 0.95, ...}"},
+                {"role": "user", "content": f"OCR: {ocr_text[:300]}\nExtracted: {json.dumps(fields)}\n\nConfidence scores:"}
             ],
-            response_format={"type": "json_object"},
-            logprobs=True,
-            top_logprobs=5,
             temperature=0.0,
+            max_tokens=256,
+            response_format={"type": "json_object"},
         )
         
-        # Aggregate logprobs per field
-        # This is non-trivial — you need to map tokens to fields
-        # Simplified version for now
-        raw_scores = {}
-        if response.choices[0].logprobs:
-            tokens = response.choices[0].logprobs.content
-            probs = [np.exp(t.logprob) for t in tokens if t.logprob]
-            if probs:
-                raw_scores["mean_token_confidence"] = float(np.mean(probs))
-                raw_scores["min_token_confidence"] = float(min(probs))
+        try:
+            scores = json.loads(response.choices[0].message.content)
+            scores = {k: max(0.0, min(1.0, float(v))) for k, v in scores.items()}
+        except (json.JSONDecodeError, ValueError):
+            scores = {}
         
-        return raw_scores
+        result["confidence_scores"] = scores
+        return result, scores
+    
+    def _format_schema_for_prompt(self, schema_json: dict) -> str:
+        """Convert JSON schema to readable field list for prompt."""
+        props = schema_json.get("properties", {})
+        required = schema_json.get("required", [])
+        
+        lines = []
+        for field, details in props.items():
+            field_type = details.get("type", "string")
+            req = " (required)" if field in required else " (optional)"
+            desc = details.get("description", "")
+            lines.append(f"  - {field}: {field_type}{req} {desc}")
+        
+        return "\n".join(lines)
 
 
-# ========== Factory Function ==========
-
-def create_extractor(backend: Optional[str] = None) -> ConstrainedExtractor:
-    """
-    Create extractor based on environment configuration.
-    Falls back to OpenAI if no config provided.
-    """
-    if backend is None:
-        backend = os.getenv("EXTRACTION_BACKEND", "openai")
-    return ConstrainedExtractor(backend=backend)
+def create_extractor(model: Optional[str] = None) -> ConstrainedExtractor:
+    return ConstrainedExtractor(model=model)
