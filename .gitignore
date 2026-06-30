@@ -12,6 +12,7 @@ wheels/
 # Runtime / local data
 logs/
 uploads/
+data/
 
 # Environment secrets
 .env

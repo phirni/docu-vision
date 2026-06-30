@@ -8,7 +8,7 @@ Every schema inherits from BaseIDDocument which enforces:
 4. Observability (model version, raw text hash for traceability)
 """
 
-from pydantic import BaseModel, validator, root_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Optional, Dict, Any, List
 from datetime import date, datetime
 import re
@@ -40,7 +40,8 @@ class BaseIDDocument(BaseModel):
     
     # ========== Common Validators ==========
     
-    @validator('dob', pre=True)
+    @field_validator('dob', mode='before')
+    @classmethod
     def normalize_dob(cls, v):
         """
         Accept multiple date formats, normalize to date object.
@@ -66,7 +67,8 @@ class BaseIDDocument(BaseModel):
         # If nothing worked, don't guess - let it be None
         return None
     
-    @validator('name')
+    @field_validator('name')
+    @classmethod
     def clean_name(cls, v):
         """Normalize names: strip whitespace, title case."""
         if v is None:
@@ -75,7 +77,8 @@ class BaseIDDocument(BaseModel):
         cleaned = ' '.join(v.split())
         return cleaned.title()
     
-    @validator('gender', pre=True)
+    @field_validator('gender', mode='before')
+    @classmethod
     def normalize_gender(cls, v):
         """Standardize gender to M/F/O or None."""
         if v is None:
@@ -89,7 +92,8 @@ class BaseIDDocument(BaseModel):
             return 'O'
         return None  # Don't guess
     
-    @validator('confidence_scores')
+    @field_validator('confidence_scores')
+    @classmethod
     def validate_confidence_range(cls, v):
         """Ensure all confidence scores are in [0,1]."""
         if v is None:
@@ -137,7 +141,8 @@ class PANSchema(BaseIDDocument):
     father_name: Optional[str] = None
     pan_number: str
     
-    @validator('pan_number')
+    @field_validator('pan_number')
+    @classmethod
     def validate_pan(cls, v):
         """
         Enforce PAN format: ABCDE1234F
@@ -152,23 +157,24 @@ class PANSchema(BaseIDDocument):
             )
         return cleaned
     
-    @validator('father_name')
+    @field_validator('father_name')
+    @classmethod
     def clean_father_name(cls, v):
         """Father's name follows same normalization as name."""
         if v is None:
             return v
         return ' '.join(v.split()).title()
     
-    @root_validator
-    def check_name_different_from_father(cls, values):
+    @model_validator(mode='after')
+    def check_name_different_from_father(self):
         """Catch common extraction error: name == father's name."""
-        name = values.get('name')
-        father = values.get('father_name')
-        if name and father and name.lower() == father.lower():
-            # This is almost certainly wrong for PAN
-            # Don't raise error, but could be flagged in production
+        if (
+            self.name
+            and self.father_name
+            and self.name.lower() == self.father_name.lower()
+        ):
             pass
-        return values
+        return self
 
 
 # ============================================================================
@@ -195,7 +201,8 @@ class IndianPassportSchema(BaseIDDocument):
     date_of_expiry: Optional[date] = None
     file_number: Optional[str] = None
     
-    @validator('passport_number')
+    @field_validator('passport_number')
+    @classmethod
     def validate_passport_number(cls, v):
         """Indian passport: 1 uppercase letter + 7 digits."""
         cleaned = v.upper().replace(" ", "").replace("-", "")
@@ -206,7 +213,8 @@ class IndianPassportSchema(BaseIDDocument):
             )
         return cleaned
     
-    @validator('nationality')
+    @field_validator('nationality')
+    @classmethod
     def normalize_nationality(cls, v):
         """Standardize nationality codes."""
         v = v.strip().upper()
@@ -214,39 +222,32 @@ class IndianPassportSchema(BaseIDDocument):
             return 'IND'
         return v
     
-    @root_validator
-    def validate_dates(cls, values):
+    @model_validator(mode='after')
+    def validate_dates(self):
         """Business rules for passport dates."""
-        issue = values.get('date_of_issue')
-        expiry = values.get('date_of_expiry')
-        
+        issue = self.date_of_issue
+        expiry = self.date_of_expiry
+
         if issue and expiry:
             if issue >= expiry:
                 raise ValueError(
                     f"Issue date {issue} must be before expiry date {expiry}"
                 )
-            
-            # Passport validity is typically 10 years for adults
-            # This is a soft check - flag but don't reject
-            max_validity_days = 10 * 365 + 10  # ~10 years with leap days
+
+            max_validity_days = 10 * 365 + 10
             actual_validity = (expiry - issue).days
             if actual_validity > max_validity_days:
-                # Unusually long validity, could be an extraction error
                 pass
-        
-        return values
-    
-    @root_validator
-    def construct_full_name(cls, values):
+
+        return self
+
+    @model_validator(mode='after')
+    def construct_full_name(self):
         """Ensure name is set from given_name + surname if needed."""
-        name = values.get('name')
-        given = values.get('given_name')
-        surname = values.get('surname')
-        
-        if (not name or name == '') and given and surname:
-            values['name'] = f"{given} {surname}"
-        
-        return values
+        if (not self.name or self.name == '') and self.given_name and self.surname:
+            self.name = f"{self.given_name} {self.surname}"
+
+        return self
 
 
 # ============================================================================
@@ -267,7 +268,8 @@ class AadhaarSchema(BaseIDDocument):
     address: Optional[str] = None
     pin_code: Optional[str] = None
     
-    @validator('aadhaar_number')
+    @field_validator('aadhaar_number')
+    @classmethod
     def validate_aadhaar(cls, v):
         """Aadhaar number must be exactly 12 digits."""
         cleaned = v.replace(" ", "").replace("-", "")
@@ -284,7 +286,8 @@ class AadhaarSchema(BaseIDDocument):
         
         return cleaned
     
-    @validator('pin_code')
+    @field_validator('pin_code')
+    @classmethod
     def validate_pin_code(cls, v):
         """Indian PIN code: 6 digits."""
         if v is None:
@@ -313,7 +316,8 @@ class UnknownDocumentSchema(BaseModel):
     possible_types: List[str] = []  # e.g., ["pan", "passport"]
     image_hash: Optional[str] = None
     
-    @validator('classifier_confidence')
+    @field_validator('classifier_confidence')
+    @classmethod
     def validate_range(cls, v):
         if not 0.0 <= v <= 1.0:
             raise ValueError(f"Confidence must be in [0,1], got {v}")
